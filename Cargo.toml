@@ -5,7 +5,6 @@ edition = "2021"
 authors = ["estchd"]
 description = "A long running threadpool for parallel task execution"
 license = "MIT OR Apache-2.0"
-documentation = "https://docs.rs/workerspool/"
 homepage = "https://github.com/estchd/workers_pool/"
 repository = "https://github.com/estchd/workers_pool/"
 
