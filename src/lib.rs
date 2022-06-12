@@ -7,9 +7,14 @@
 
 use std::sync::Arc;
 use std::{thread};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use crossbeam::channel::{TryRecvError, unbounded};
 
+pub enum TaskState {
+    Finished,
+    Continue
+}
 
 /// Abstraction of a worker that can execute computations
 ///
@@ -22,11 +27,12 @@ pub trait Worker: Default  {
     type Result: 'static + Send;
     type Context: 'static + Send + Sync;
 
-    fn execute(&mut self, data: Self::Data, context: &Arc<Self::Context>) -> Self::Result;
+    fn execute(&mut self, data: Option<Self::Data>, context: &Arc<Self::Context>) -> (Option<Self::Result>, TaskState);
 }
 
 /// Abstraction of a threadpool for executing units of computation in parallel.
 pub struct WorkersPool<W: Worker> {
+    status: Arc<AtomicBool>,
     result_receiver: crossbeam::channel::Receiver<W::Result>,
     work_sender: crossbeam::channel::Sender<W::Data>,
     #[allow(dead_code)]
@@ -38,6 +44,8 @@ impl<W: Worker> WorkersPool<W> {
         let (result_sender,result_receiver) = unbounded();
         let (work_sender,work_receiver) = unbounded();
 
+        let status = Arc::new(AtomicBool::new(true));
+
         let context = Arc::new(context);
 
         let thread_count = num_cpus::get();
@@ -48,32 +56,58 @@ impl<W: Worker> WorkersPool<W> {
             let work_receiver = work_receiver.clone();
             let result_sender = result_sender.clone();
 
+            let status_clone = status.clone();
             let context_clone = context.clone();
 
             let thread = thread::spawn(move || {
                 let mut worker = W::default();
                 let context = context_clone;
+                let status = status_clone;
+
+                let mut has_task = false;
 
                 loop {
-                    let work = work_receiver.recv();
+                    let status_bool = status.load(Ordering::Relaxed);
 
-                    let work = match work {
-                        Err(_) => {
-                            return;
-                        },
-                        Ok(work) => {
-                            work
-                        }
+                    if !status_bool {
+                        return;
+                    }
+
+                    let (result, task_state) = if has_task {
+                        worker.execute(None, &context)
+                    }
+                    else {
+                        let work = work_receiver.recv();
+
+                        let work = match work {
+                            Err(_) => {
+                                return;
+                            },
+                            Ok(work) => {
+                                work
+                            }
+                        };
+
+                        worker.execute(Some(work), &context)
                     };
 
-                    let result = worker.execute(work, &context);
+                    match task_state {
+                        TaskState::Finished => {
+                            has_task = false;
+                        }
+                        TaskState::Continue => {
+                            has_task = true;
+                        }
+                    }
 
-                    let send_result = result_sender.send(result);
+                    if let Some(result) = result {
+                        let send_result = result_sender.send(result);
 
-                    match send_result {
-                        Ok(_) => {}
-                        Err(_) => {
-                            return;
+                        match send_result {
+                            Ok(_) => {}
+                            Err(_) => {
+                                return;
+                            }
                         }
                     }
                 }
@@ -83,6 +117,7 @@ impl<W: Worker> WorkersPool<W> {
         }
 
         Self {
+            status,
             result_receiver,
             work_sender,
             workers
@@ -153,5 +188,11 @@ impl<W: Worker> WorkersPool<W> {
     /// Checks if there are results available
     pub fn has_results(&self) -> bool {
         !self.result_receiver.is_empty()
+    }
+}
+
+impl<W: Worker> Drop for WorkersPool<W> {
+    fn drop(&mut self) {
+        self.status.store(false, Ordering::Relaxed);
     }
 }
